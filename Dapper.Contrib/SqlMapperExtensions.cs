@@ -23,6 +23,11 @@ namespace Dapper.Contrib.Extensions
             bool IsDirty { get; set; }
         }
 
+        public class IdParameter
+        {
+            public object Id { get; set; }
+        }
+
         public interface ITableNameMapper
         {
             string GetTableName(Type type);
@@ -41,7 +46,8 @@ namespace Dapper.Contrib.Extensions
 																							{"sqlconnection", new SqlServerAdapter()},
 																							{"sqlceconnection", new SqlCeServerAdapter()},
 																							{"npgsqlconnection", new PostgresAdapter()},
-																							{"sqliteconnection", new SQLiteAdapter()}
+																							{"sqliteconnection", new SQLiteAdapter()},
+                                                                                            {"odbcconnection", new OdbcAdapter()}
 																						};
 
         private static IEnumerable<PropertyInfo> ComputedPropertiesCache(Type type)
@@ -119,6 +125,9 @@ namespace Dapper.Contrib.Extensions
         {
             var type = typeof(T);
 
+            var adapter = GetFormatter(connection);
+            var idParamName = adapter.GetParameterNameWithPrefix("Id");
+
             string sql;
             if (!GetQueries.TryGetValue(type.TypeHandle, out sql))
             {
@@ -133,18 +142,15 @@ namespace Dapper.Contrib.Extensions
                 var name = GetTableName(type);
 
                 // TODO: query information schema and only select fields that are both in information schema and underlying class / interface 
-                sql = "select * from " + name + " where " + onlyKey.Name + " = @id";
+                sql = "select * from " + name + " where " + onlyKey.Name + " = " + idParamName;
                 GetQueries[type.TypeHandle] = sql;
             }
-
-            var dynParms = new DynamicParameters();
-            dynParms.Add("@id", id);
 
             T obj;
 
             if (type.IsInterface)
             {
-                var res = connection.Query(sql, dynParms).FirstOrDefault() as IDictionary<string, object>;
+                var res = connection.Query(sql, new IdParameter {Id = id}).FirstOrDefault() as IDictionary<string, object>;
 
                 if (res == null)
                     return null;
@@ -161,7 +167,7 @@ namespace Dapper.Contrib.Extensions
             }
             else
             {
-                obj = connection.Query<T>(sql, dynParms, transaction, commandTimeout: commandTimeout).FirstOrDefault();
+                obj = connection.Query<T>(sql, new IdParameter {Id = id}, transaction, commandTimeout: commandTimeout).FirstOrDefault();
             }
             return obj;
         }
@@ -271,7 +277,8 @@ namespace Dapper.Contrib.Extensions
             var allProperties = TypePropertiesCache(type);
             var keyProperties = KeyPropertiesCache(type);
             var computedProperties = ComputedPropertiesCache(type);
-            var allPropertiesExceptKeyAndComputed = allProperties.Except(keyProperties.Union(computedProperties)).ToList();
+            var allPropertiesExceptKeyAndComputed = allProperties.Except(keyProperties.Where(kp => !IsWriteable(kp)).Union(computedProperties)).ToList();
+            var adapter = GetFormatter(connection);
 
             for (var i = 0; i < allPropertiesExceptKeyAndComputed.Count(); i++)
             {
@@ -285,7 +292,7 @@ namespace Dapper.Contrib.Extensions
             for (var i = 0; i < allPropertiesExceptKeyAndComputed.Count(); i++)
             {
                 var property = allPropertiesExceptKeyAndComputed.ElementAt(i);
-                sbParameterList.AppendFormat("@{0}", property.Name);
+                sbParameterList.Append(adapter.GetParameterNameWithPrefix(property.Name));
                 if (i < allPropertiesExceptKeyAndComputed.Count() - 1)
                     sbParameterList.Append(", ");
             }
@@ -296,7 +303,6 @@ namespace Dapper.Contrib.Extensions
 
             if (!isList)    //single entity
             {
-                var adapter = GetFormatter(connection);
                 returnVal = adapter.Insert(connection, transaction, commandTimeout, name, sbColumnList.ToString(),
                     sbParameterList.ToString(), keyProperties, entityToInsert);
             }
@@ -342,11 +348,12 @@ namespace Dapper.Contrib.Extensions
             var allProperties = TypePropertiesCache(type);
             var computedProperties = ComputedPropertiesCache(type);
             var nonIdProps = allProperties.Except(keyProperties.Union(computedProperties)).ToList();
+            var adapter = GetFormatter(connection);
 
             for (var i = 0; i < nonIdProps.Count(); i++)
             {
                 var property = nonIdProps.ElementAt(i);
-                sb.AppendFormat("[{0}] = @{1}", property.Name, property.Name);
+                sb.AppendFormat("[{0}] = {1}", property.Name, adapter.GetParameterNameWithPrefix(property.Name));
                 if (i < nonIdProps.Count() - 1)
                     sb.AppendFormat(", ");
             }
@@ -354,7 +361,7 @@ namespace Dapper.Contrib.Extensions
             for (var i = 0; i < keyProperties.Count(); i++)
             {
                 var property = keyProperties.ElementAt(i);
-                sb.AppendFormat("[{0}] = @{1}", property.Name, property.Name);
+                sb.AppendFormat("[{0}] = {1}", property.Name, adapter.GetParameterNameWithPrefix(property.Name));
                 if (i < keyProperties.Count() - 1)
                     sb.AppendFormat(" and ");
             }
@@ -384,6 +391,7 @@ namespace Dapper.Contrib.Extensions
                 throw new ArgumentException("Entity must have at least one [Key] property");
 
             var name = GetTableName(type);
+            var adapter = GetFormatter(connection);
 
             var sb = new StringBuilder();
             sb.AppendFormat("delete from {0} where ", name);
@@ -391,7 +399,7 @@ namespace Dapper.Contrib.Extensions
             for (var i = 0; i < keyProperties.Count(); i++)
             {
                 var property = keyProperties.ElementAt(i);
-                sb.AppendFormat("[{0}] = @{1}", property.Name, property.Name);
+                sb.AppendFormat("[{0}] = {1}", property.Name, adapter.GetParameterNameWithPrefix(property.Name));
                 if (i < keyProperties.Count() - 1)
                     sb.AppendFormat(" and ");
             }
@@ -627,11 +635,17 @@ namespace Dapper.Contrib.Extensions
 
 public partial interface ISqlAdapter
 {
+    string GetParameterNameWithPrefix(string name);
     int Insert(IDbConnection connection, IDbTransaction transaction, int? commandTimeout, String tableName, string columnList, string parameterList, IEnumerable<PropertyInfo> keyProperties, object entityToInsert);
 }
 
 public partial class SqlServerAdapter : ISqlAdapter
 {
+    public string GetParameterNameWithPrefix(string name)
+    {
+        return "@" + name;
+    }
+
     public int Insert(IDbConnection connection, IDbTransaction transaction, int? commandTimeout, String tableName, string columnList, string parameterList, IEnumerable<PropertyInfo> keyProperties, object entityToInsert)
     {
 
@@ -645,7 +659,7 @@ public partial class SqlServerAdapter : ISqlAdapter
         var idProperty = propertyInfos.First();
         if (idProperty.PropertyType.Name == "Int16") //for short id/key types issue #196
             idProperty.SetValue(entityToInsert, (Int16)id, null);
-        else
+        else if(idProperty.PropertyType.Name == "Int32")
             idProperty.SetValue(entityToInsert, id, null);
         return id;
     }
@@ -653,6 +667,11 @@ public partial class SqlServerAdapter : ISqlAdapter
 
 public partial class SqlCeServerAdapter : ISqlAdapter
 {
+    public string GetParameterNameWithPrefix(string name)
+    {
+        return "@" + name;
+    }
+
     public int Insert(IDbConnection connection, IDbTransaction transaction, int? commandTimeout, String tableName, string columnList, string parameterList, IEnumerable<PropertyInfo> keyProperties, object entityToInsert)
     {
         var cmd = String.Format("insert into {0} ({1}) values ({2})", tableName, columnList, parameterList);
@@ -666,7 +685,7 @@ public partial class SqlCeServerAdapter : ISqlAdapter
             var idProperty = propertyInfos.First();
             if (idProperty.PropertyType.Name == "Int16") //for short id/key types issue #196
                 idProperty.SetValue(entityToInsert, (Int16)id, null);
-            else
+            else if (idProperty.PropertyType.Name == "Int32")
                 idProperty.SetValue(entityToInsert, (int)id, null);
         }
         return (int)id;
@@ -676,6 +695,11 @@ public partial class SqlCeServerAdapter : ISqlAdapter
 
 public partial class PostgresAdapter : ISqlAdapter
 {
+    public string GetParameterNameWithPrefix(string name)
+    {
+        return "@" + name;
+    }
+
     public int Insert(IDbConnection connection, IDbTransaction transaction, int? commandTimeout, String tableName, string columnList, string parameterList, IEnumerable<PropertyInfo> keyProperties, object entityToInsert)
     {
         var sb = new StringBuilder();
@@ -715,6 +739,11 @@ public partial class PostgresAdapter : ISqlAdapter
 
 public partial class SQLiteAdapter : ISqlAdapter
 {
+    public string GetParameterNameWithPrefix(string name)
+    {
+        return "@" + name;
+    }
+
     public int Insert(IDbConnection connection, IDbTransaction transaction, int? commandTimeout, String tableName, string columnList, string parameterList, IEnumerable<PropertyInfo> keyProperties, object entityToInsert)
     {
         var cmd = String.Format("insert into {0} ({1}) values ({2}); select last_insert_rowid() id", tableName, columnList, parameterList);
@@ -722,8 +751,47 @@ public partial class SQLiteAdapter : ISqlAdapter
         var id = (int)r.First().id;
         var propertyInfos = keyProperties as PropertyInfo[] ?? keyProperties.ToArray();
         if (propertyInfos.Any())
-            propertyInfos.First().SetValue(entityToInsert, id, null);
+        {
+            var idProperty = propertyInfos.First();
+            if (idProperty.PropertyType.Name == "Int16") //for short id/key types issue #196
+                idProperty.SetValue(entityToInsert, (Int16)id, null);
+            else if (idProperty.PropertyType.Name == "Int32")
+                idProperty.SetValue(entityToInsert, id, null);
+        }
+
         return id;
     }
 
+}
+
+//MS Access | SQL Server via ODBC
+public partial class OdbcAdapter : ISqlAdapter
+{
+    public string GetParameterNameWithPrefix(string name)
+    {
+        return "?" + name + "?";
+    }
+
+    public int Insert(IDbConnection connection, IDbTransaction transaction, int? commandTimeout, string tableName, string columnList, string parameterList, IEnumerable<PropertyInfo> keyProperties, object entityToInsert)
+    {
+        var cmd = String.Format("insert into {0} ({1}) values ({2});", tableName, columnList, parameterList);
+        connection.Execute(cmd, entityToInsert, transaction, commandTimeout);
+
+        int id = 0;
+        var propertyInfos = keyProperties as PropertyInfo[] ?? keyProperties.ToArray();
+        if (propertyInfos.Any(p => p.PropertyType == typeof(Int16) || p.PropertyType == typeof(Int32)))
+        {
+            var r = connection.Query("select @@identity AS id", transaction: transaction, commandTimeout: commandTimeout);
+            id = (int)r.First().id;
+
+            var idProperty = propertyInfos.First();
+
+            if (idProperty.PropertyType.Name == "Int16") //for short id/key types issue #196
+                idProperty.SetValue(entityToInsert, (Int16)id, null);
+            else if (idProperty.PropertyType.Name == "Int32")
+                idProperty.SetValue(entityToInsert, (int)id, null);
+
+        }
+        return id;        
+    }
 }
